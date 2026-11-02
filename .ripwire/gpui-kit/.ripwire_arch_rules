@@ -1,0 +1,46 @@
+# Layering rules for the vendored gpui-kit (vendor/gpui-kit). ripwire prunes
+# vendor/ from the herdr-app root, and nested roots are refused, so the kit
+# runs as its own root from THIS directory (the baseline is read from the
+# current directory):
+#   cd .ripwire/gpui-kit && ripwire ../../vendor/gpui-kit --arch=.ripwire_arch_rules
+# Paths below are relative to vendor/gpui-kit. Current violations live in the
+# .ripwire_arch_baseline beside this file; only new ones fail (exit 2).
+# Layers match by substring of the root-relative path; the first match wins.
+#
+# What ripwire can see here (ripwire 0.6.7): `mod NAME;` edges inside each
+# crate (lib.rs, mod.rs and nested modules), and `./` imports in the wasm
+# example.
+# Crate imports (`gpui_base::`, `gpui_fps::`), `use crate::...` and
+# `#[path = ...] mod` are NOT resolved, so the crate layering below is INERT:
+# it documents the intended direction and starts gating if a later ripwire
+# resolves crate edges. The ownership rules match edge kinds it does resolve.
+
+# --- Layers -------------------------------------------------------------
+# Examples, benches and integration tests of each crate (consumers only).
+# In-crate test modules (crates/shell/src/tests/) stay in their crate's layer.
+layer kit_examples = crates/base/examples/ crates/base/benches/ crates/base/tests/ crates/shell/tests/
+# The script shell: JS runtime, components, docks. Depends on base and fps
+# (crates/shell/Cargo.toml). Its rquickjs-compat helper crate sits inside it.
+layer shell = crates/shell/
+# Frame-timing overlay. A leaf crate: no kit dependency.
+layer fps = crates/fps/
+# Component library. A leaf crate: no kit dependency.
+layer base = crates/base/
+
+# --- Crate direction: shell -> base, shell -> fps (INERT: crate edges) -----
+deny base -> shell
+deny base -> fps
+deny fps -> shell
+deny fps -> base
+# Library code never depends on examples, benches or tests.
+deny base -> kit_examples
+deny fps -> kit_examples
+deny shell -> kit_examples
+
+# --- File inclusion stays inside one crate -------------------------------
+# A crate's files never `mod`-include another crate's files.
+deny path ^crates/base/ -> ^crates/(?!base/)
+deny path ^crates/fps/ -> ^crates/(?!fps/)
+deny path ^crates/shell/ -> ^crates/(?!shell/)
+# Library sources never declare example, bench or test files as modules.
+deny path ^crates/[^/]+/src/ -> ^crates/[^/]+/(examples|benches|tests)/

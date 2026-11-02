@@ -1,0 +1,140 @@
+# Layering rules for `ripwire . --arch=.ripwire_arch_rules`, run from the
+# herdr-app checkout root (the baseline is read from the current directory).
+# They describe the INTENDED structure. Current violations live in
+# .ripwire_arch_baseline; only new ones fail (exit 2). Update the baseline in
+# its own reviewed commit on racecraft/tooling (`--baseline-update`), never to
+# hide a new edge.
+# Layers match by substring of the root-relative path; the first match wins,
+# so narrower layers come before the broader ones that contain them.
+# `deny path FROM_REGEX -> TO_REGEX` rules match root-relative paths directly.
+#
+# What ripwire can see here (ripwire 0.6.7, checked against upstream master):
+# - Rust: `mod NAME;` in src/main.rs, resolved to src/NAME.rs. Nested `mod`
+#   (src/window.rs -> src/window/*), `use crate::...`, `super::*`, crate
+#   imports (`gpui_shell::`) and `#[path = ...] mod` are NOT resolved to files.
+# - JS/TS: relative `./` imports (defaults/ mods and frame, scripts/*.ts).
+# - Python: same-directory module imports (scripts/).
+# A rule marked INERT names a real constraint whose edges ripwire cannot see
+# today. It documents intent and starts gating if a later ripwire resolves
+# those edges. Every other rule covers an edge kind ripwire resolves here.
+# A `deny X -> X` inside one layer never fires, so per-directory isolation
+# below uses `deny path` rules instead.
+# vendor/ is never indexed from this root (built-in vendor pruning); the
+# vendored gpui-kit has its own rules in .ripwire/gpui-kit/.
+
+# --- Layers -------------------------------------------------------------
+# Rust app: the binary root that declares every top-level module.
+layer app_entry = src/main.rs
+# Rust app: every other module, its submodule directories and in-file tests.
+layer app = src/
+# FFI bindings to libghostty, and the two build scripts.
+layer ffi = crates/ghostty-sys/
+layer build = build.rs
+# Rust integration tests (cargo `tests/` targets).
+layer tests = tests/
+# Script tests: bun `*.test.ts` and python `test_*.py` under scripts/.
+layer script_tests = .test.ts scripts/test_
+# Repo tooling: packaging, install, notices, docs generation, sandbox, bench.
+layer scripts = scripts/
+# What ships in the box (built into the app): mods, frame, layouts, keys.
+layer mods = defaults/mods/
+layer frame = defaults/frame/
+layer defaults = defaults/
+
+# --- Rust module ownership ----------------------------------------------
+# Only src/main.rs declares top-level modules. Any other file reaching a
+# top-level module file means a second `mod` declaration (a duplicate module).
+deny path ^src/(?!main\.rs$)[^/]+\.rs$ -> ^src/[^/]+\.rs$
+deny path ^src/.+/ -> ^src/[^/]+\.rs$
+# A submodule directory belongs to its parent file: only src/window.rs and its
+# own files reach src/window/, and the same for mods and core_bin.
+# INERT: nested `mod` edges are not resolved.
+deny path ^src/(?!window\.rs$|window/) -> ^src/window/
+deny path ^src/(?!mods\.rs$|mods/) -> ^src/mods/
+deny path ^src/(?!core_bin\.rs$|core_bin/) -> ^src/core_bin/
+# The binary root declares modules; nothing declares or imports it.
+deny app -> app_entry
+deny tests -> app_entry
+
+# --- Shipped code never depends on repo tooling or tests ----------------
+# The app, FFI crate and build scripts never reach tests or scripts.
+# INERT for Rust edges (see above); kept as the stated boundary.
+deny app_entry -> tests
+deny app -> tests
+deny ffi -> tests
+deny build -> tests
+deny app_entry -> scripts
+deny app -> scripts
+deny ffi -> scripts
+deny build -> scripts
+deny app_entry -> script_tests
+deny app -> script_tests
+# The FFI crate is a leaf: it never reaches the app (INERT: crate edges).
+deny ffi -> app
+deny ffi -> app_entry
+# Shipped mods and frame code never import repo code, tooling or tests.
+deny mods -> app
+deny mods -> app_entry
+deny mods -> scripts
+deny mods -> script_tests
+deny mods -> tests
+deny frame -> app
+deny frame -> app_entry
+deny frame -> scripts
+deny frame -> script_tests
+deny frame -> tests
+deny defaults -> scripts
+deny defaults -> script_tests
+deny defaults -> tests
+
+# --- Mods and frame pages are self-contained (live: `./` imports) --------
+# AGENTS.md: everything outside the small core is a mod, with its own code,
+# "even at the price of some repetition". A mod or frame page imports only
+# files in its own directory; shared behavior goes through the host modules
+# (`gpui-kit`, `gpui-base`, `herdr`), never through another mod's files.
+# One line per shipped directory: add a line when you add a mod or page.
+deny path ^defaults/mods/agents/ -> ^defaults/(?!mods/agents/)
+deny path ^defaults/mods/changes/ -> ^defaults/(?!mods/changes/)
+deny path ^defaults/mods/confirm/ -> ^defaults/(?!mods/confirm/)
+deny path ^defaults/mods/files/ -> ^defaults/(?!mods/files/)
+deny path ^defaults/mods/help/ -> ^defaults/(?!mods/help/)
+deny path ^defaults/mods/machine-add/ -> ^defaults/(?!mods/machine-add/)
+deny path ^defaults/mods/menu/ -> ^defaults/(?!mods/menu/)
+deny path ^defaults/mods/new-menu/ -> ^defaults/(?!mods/new-menu/)
+deny path ^defaults/mods/pane/ -> ^defaults/(?!mods/pane/)
+deny path ^defaults/mods/peek/ -> ^defaults/(?!mods/peek/)
+deny path ^defaults/mods/picker/ -> ^defaults/(?!mods/picker/)
+deny path ^defaults/mods/prompt/ -> ^defaults/(?!mods/prompt/)
+deny path ^defaults/mods/spaces/ -> ^defaults/(?!mods/spaces/)
+deny path ^defaults/mods/tabs/ -> ^defaults/(?!mods/tabs/)
+deny path ^defaults/mods/terminals-bar/ -> ^defaults/(?!mods/terminals-bar/)
+deny path ^defaults/mods/terminals-pane/ -> ^defaults/(?!mods/terminals-pane/)
+deny path ^defaults/mods/toast/ -> ^defaults/(?!mods/toast/)
+deny path ^defaults/mods/win98/ -> ^defaults/(?!mods/win98/)
+deny path ^defaults/mods/workspace-chrome/ -> ^defaults/(?!mods/workspace-chrome/)
+deny path ^defaults/mods/workspace-status/ -> ^defaults/(?!mods/workspace-status/)
+deny path ^defaults/mods/worktree/ -> ^defaults/(?!mods/worktree/)
+deny path ^defaults/frame/feedback/ -> ^defaults/(?!frame/feedback/)
+deny path ^defaults/frame/palette/ -> ^defaults/(?!frame/palette/)
+deny path ^defaults/frame/settings/ -> ^defaults/(?!frame/settings/)
+deny path ^defaults/frame/welcome/ -> ^defaults/(?!frame/welcome/)
+deny path ^defaults/frame/whatsnew/ -> ^defaults/(?!frame/whatsnew/)
+# The win98 art generators (bun, run by hand) feed the mod; the mod never
+# imports them back.
+deny path ^defaults/mods/win98/[^/]+$ -> ^defaults/mods/win98/art/
+
+# --- Repo tooling (live: `./` and python imports) -----------------------
+# Script tests import the script under test; scripts never import tests.
+deny scripts -> script_tests
+# Tooling reads shipped files as data; it never imports app code or mods.
+deny scripts -> app
+deny scripts -> app_entry
+deny scripts -> mods
+deny scripts -> frame
+deny script_tests -> app
+deny script_tests -> mods
+deny script_tests -> frame
+# Rust integration tests and script tests stay separate suites.
+deny tests -> scripts
+deny tests -> script_tests
+deny script_tests -> tests
