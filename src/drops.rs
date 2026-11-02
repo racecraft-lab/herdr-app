@@ -43,18 +43,15 @@ mod mac {
 
     /// A file directly in a sandboxed drag folder, `.../TemporaryItems/NSIRD_*/`.
     fn is_sandboxed(path: &Path) -> bool {
-        let next = path.components().skip(1);
-        path.components().zip(next).any(|(a, b)| a.as_os_str() == "TemporaryItems" && b.as_os_str().as_encoded_bytes().starts_with(b"NSIRD_"))
+        path.components().zip(path.components().skip(1)).any(|(a, b)| a.as_os_str() == "TemporaryItems" && b.as_os_str().as_encoded_bytes().starts_with(b"NSIRD_"))
     }
 
     fn stage_with(paths: Vec<PathBuf>, dir: &Path, staged: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
-        let stage = |p: PathBuf| {
-            copy_into(&p, dir, 256 << 20).unwrap_or_else(|e| {
-                tracing::warn!("cannot copy dropped file {}: {e}", p.display());
-                p
-            })
-        };
-        paths.into_iter().map(|p| if staged(&p) { stage(p) } else { p }).collect()
+        let copy = |p: PathBuf| copy_into(&p, dir, 256 << 20).unwrap_or_else(|e| {
+            tracing::warn!("cannot copy dropped file {}: {e}", p.display());
+            p
+        });
+        paths.into_iter().map(|p| if staged(&p) { copy(p) } else { p }).collect()
     }
 
     /// Checks `dir` is ours alone (a 0700 directory, not a link), then removes
