@@ -462,8 +462,7 @@ impl TerminalView {
     /// gets each file copied there first (`hc put`), and its path there.
     fn dropped(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
         if !self.address.contains('/') {
-            let dir = std::env::temp_dir().join("herdr-drops");
-            let text = local_drop_text(paths, &dir, |p| cfg!(target_os = "macos") && is_screenshot_thumbnail(p));
+            let text = local_drop_text(paths, &drops_dir(), |p| cfg!(target_os = "macos") && is_screenshot_thumbnail(p));
             let bytes = self.grid.borrow().vt.paste_bytes(&text);
             return self.send(&bytes);
         }
@@ -748,8 +747,13 @@ pub(crate) fn shown_title(title: &str) -> &str {
 /// (a live screenshot thumbnail, say). macOS lets only the process that
 /// received the drop read it, so it must be copied from here.
 fn is_screenshot_thumbnail(path: &std::path::Path) -> bool {
-    let parts: Vec<_> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
-    parts.windows(2).any(|w| w[0] == "TemporaryItems" && w[1].starts_with("NSIRD_"))
+    let parts: Vec<_> = path.components().map(|c| c.as_os_str()).collect();
+    parts.windows(2).any(|w| w[0] == "TemporaryItems" && w[1].as_encoded_bytes().starts_with(b"NSIRD_"))
+}
+
+/// Where dropped screenshots are copied, for the core's programs to read.
+fn drops_dir() -> PathBuf {
+    std::env::temp_dir().join("herdr-drops")
 }
 
 /// Dropped paths typed in locally: each `staged` one swapped for a copy made
@@ -774,28 +778,46 @@ fn local_drop_text(paths: Vec<PathBuf>, dir: &std::path::Path, staged: impl Fn(&
     quote_paths(safe)
 }
 
-/// Copies `src` into `dir` (ours, 0700) as `herdr-drop-<nanos>[.ext]`, 0600,
-/// first pruning day-old copies there. Refuses links, non-files and files over
-/// `cap` bytes, leaving no partial copy.
+/// Hourly, while the app runs, removes day-old copies from the drop folder.
 #[cfg(target_os = "macos")]
-fn copy_into(src: &std::path::Path, dir: &std::path::Path, cap: u64) -> std::io::Result<PathBuf> {
-    use std::io::{Error, ErrorKind, Read};
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(dir)
-        && e.kind() != ErrorKind::AlreadyExists
-    {
-        return Err(e);
-    }
+pub fn prune_drops_hourly() {
+    std::thread::spawn(|| loop {
+        let _ = prune_drops(&drops_dir());
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    });
+}
+
+/// Checks `dir` is ours alone (a 0700 directory, not a link), then removes
+/// the copies there over a day old.
+#[cfg(target_os = "macos")]
+fn prune_drops(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let d = std::fs::symlink_metadata(dir)?;
-    if !d.is_dir() || d.uid() != unsafe { libc::geteuid() } {
-        return Err(Error::other("drop folder is not our own directory"));
+    if !d.is_dir() || d.uid() != unsafe { libc::geteuid() } || d.mode() & 0o777 != 0o700 {
+        return Err(std::io::Error::other("drop folder is not our own private directory"));
     }
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+    for e in std::fs::read_dir(dir)?.flatten() {
         let old = e.metadata().ok().filter(|m| m.is_file()).and_then(|m| m.modified().ok()?.elapsed().ok());
         if e.file_name().to_string_lossy().starts_with("herdr-drop-") && old.is_some_and(|a| a.as_secs() > 86_400) {
             let _ = std::fs::remove_file(e.path());
         }
     }
+    Ok(())
+}
+
+/// Copies `src` into `dir` (made ours, see `prune_drops`) as
+/// `herdr-drop-<nanos>[.ext]`, 0600. Refuses links, non-files and files over
+/// `cap` bytes, leaving no partial copy.
+#[cfg(target_os = "macos")]
+fn copy_into(src: &std::path::Path, dir: &std::path::Path, cap: u64) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind, Read};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(dir)
+        && e.kind() != ErrorKind::AlreadyExists
+    {
+        return Err(e);
+    }
+    prune_drops(dir)?;
     // Read here, in the app, which holds the drop's access; the core can't.
     let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(src)?;
     let ext = src.extension().and_then(|e| e.to_str()).filter(|e| e.len() <= 8 && e.bytes().all(|b| b.is_ascii_alphanumeric()));
@@ -1722,6 +1744,12 @@ mod tests {
         ] {
             assert!(!super::is_screenshot_thumbnail(Path::new(p)), "{p}");
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let between = Path::new("/T/TemporaryItems").join(std::ffi::OsStr::from_bytes(b"\xff")).join("NSIRD_x/a.png");
+            assert!(!super::is_screenshot_thumbnail(&between), "a non-UTF-8 folder in between");
+        }
     }
 
     /// A fresh scratch directory; never named `TemporaryItems`, which macOS won't let us remove.
@@ -1772,6 +1800,10 @@ mod tests {
         let fake = root.join("fake-drops");
         std::os::unix::fs::symlink(&drops, &fake).unwrap();
         assert!(super::copy_into(&real, &fake, 1024).is_err(), "a symlinked drop folder");
+        let open = root.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert!(super::copy_into(&real, &open, 1024).is_err(), "a drop folder others can read");
         let _ = std::fs::remove_dir_all(&root);
     }
 
