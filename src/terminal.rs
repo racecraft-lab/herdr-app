@@ -462,6 +462,7 @@ impl TerminalView {
     /// gets each file copied there first (`hc put`), and its path there.
     fn dropped(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
         if !self.address.contains('/') {
+            let paths = stage_screenshot_drops(paths, &std::env::temp_dir());
             let text = quote_paths(paths.iter().map(|p| p.to_string_lossy().into_owned()));
             let bytes = self.grid.borrow().vt.paste_bytes(&text);
             return self.send(&bytes);
@@ -741,6 +742,38 @@ pub(crate) fn shown_title(title: &str) -> &str {
     let rest = title.trim_start_matches(|c: char| spinner(c) || c.is_whitespace());
     let led = title.len() - rest.len();
     if rest.is_empty() || !title[..led].chars().any(spinner) || !title[..led].ends_with(char::is_whitespace) { title } else { rest }
+}
+
+/// A live macOS screenshot thumbnail dragged before macOS saves it: a file in
+/// `.../TemporaryItems/NSIRD_screencaptureui_*/`. macOS lets only the process
+/// that received the drop read it, so it must be copied from here.
+fn is_screenshot_thumbnail(path: &std::path::Path) -> bool {
+    let parts: Vec<_> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
+    parts.windows(2).any(|w| w[0] == "TemporaryItems" && w[1].starts_with("NSIRD_screencaptureui_"))
+}
+
+/// Screenshot thumbnails copied by this process into `dest`, other paths as
+/// they were. A thumbnail that can't be copied keeps its original path.
+fn stage_screenshot_drops(paths: Vec<PathBuf>, dest: &std::path::Path) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .map(|p| {
+            if !is_screenshot_thumbnail(&p) {
+                return p;
+            }
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let copy = dest.join(format!("herdr-drop-{stamp}-{name}"));
+            // Read here, in the app, which holds the drop's access; the core can't.
+            match std::fs::read(&p).and_then(|bytes| std::fs::write(&copy, bytes)) {
+                Ok(()) => copy,
+                Err(e) => {
+                    tracing::warn!("cannot copy dropped screenshot {}: {e}", p.display());
+                    p
+                }
+            }
+        })
+        .collect()
 }
 
 /// Paths as a shell reads them, space-separated with a trailing space: bare
@@ -1619,6 +1652,53 @@ impl Focusable for TerminalView {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    const THUMB: &str = "/var/folders/ab/xyz/T/TemporaryItems/NSIRD_screencaptureui_Q1w2E3/Screenshot 2026-11-02 at 3.10.04\u{202f}PM.png";
+
+    #[test]
+    fn screenshot_thumbnail_paths_are_recognised() {
+        assert!(super::is_screenshot_thumbnail(Path::new(THUMB)));
+        assert!(super::is_screenshot_thumbnail(Path::new("/T/TemporaryItems/NSIRD_screencaptureui_x/a.png")));
+    }
+
+    #[test]
+    fn other_paths_are_not_screenshot_thumbnails() {
+        for p in [
+            "/Users/me/Desktop/Screenshot 2026-11-02 at 3.10.04\u{202f}PM.png",
+            "/var/folders/ab/T/TemporaryItems/other/a.png",
+            "/var/folders/ab/T/NSIRD_screencaptureui_x/a.png",
+            "/var/folders/ab/T/TemporaryItems/xNSIRD_screencaptureui_x/a.png",
+            "NSIRD_screencaptureui_x/TemporaryItems/a.png",
+            "",
+        ] {
+            assert!(!super::is_screenshot_thumbnail(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn screenshot_drops_are_copied_and_other_drops_kept() {
+        let root = std::env::temp_dir().join(format!("herdr-drop-test-{}", std::process::id()));
+        let thumb_dir = root.join("TemporaryItems/NSIRD_screencaptureui_t");
+        std::fs::create_dir_all(&thumb_dir).unwrap();
+        let dest = root.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let thumb = thumb_dir.join("Screenshot 3.10.04\u{202f}PM.png");
+        std::fs::write(&thumb, b"png-bytes").unwrap();
+        let finder = root.join("report.txt");
+        std::fs::write(&finder, b"x").unwrap();
+        let gone = thumb_dir.join("missing.png");
+
+        let out = super::stage_screenshot_drops(vec![thumb.clone(), finder.clone(), gone.clone()], &dest);
+        assert_eq!(out.len(), 3);
+        assert!(out[0].starts_with(&dest) && out[0].to_string_lossy().ends_with("Screenshot 3.10.04\u{202f}PM.png"));
+        assert_eq!(std::fs::read(&out[0]).unwrap(), b"png-bytes");
+        assert_eq!(out[1], finder);
+        assert_eq!(out[2], gone, "an unreadable thumbnail keeps its path");
+        // macOS refuses to remove a directory named TemporaryItems; the files go, the empty tree may stay.
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[gpui::test]
     fn terminal_release_ends_window_text_selection(cx: &mut gpui::TestAppContext) {
         use gpui::*;
