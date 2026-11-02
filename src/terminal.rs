@@ -462,7 +462,7 @@ impl TerminalView {
     /// gets each file copied there first (`hc put`), and its path there.
     fn dropped(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
         if !self.address.contains('/') {
-            let paths = stage_screenshot_drops(paths, &std::env::temp_dir());
+            let paths = if cfg!(target_os = "macos") { stage_screenshot_drops(paths, &std::env::temp_dir()) } else { paths };
             let text = quote_paths(paths.iter().map(|p| p.to_string_lossy().into_owned()));
             let bytes = self.grid.borrow().vt.paste_bytes(&text);
             return self.send(&bytes);
@@ -765,7 +765,12 @@ fn stage_screenshot_drops(paths: Vec<PathBuf>, dest: &std::path::Path) -> Vec<Pa
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let copy = dest.join(format!("herdr-drop-{stamp}-{name}"));
             // Read here, in the app, which holds the drop's access; the core can't.
-            match std::fs::read(&p).and_then(|bytes| std::fs::write(&copy, bytes)) {
+            // create_new: never overwrite or follow an existing file at `copy`.
+            let written = std::fs::read(&p).and_then(|bytes| {
+                use std::io::Write;
+                std::fs::OpenOptions::new().write(true).create_new(true).open(&copy)?.write_all(&bytes)
+            });
+            match written {
                 Ok(()) => copy,
                 Err(e) => {
                     tracing::warn!("cannot copy dropped screenshot {}: {e}", p.display());
