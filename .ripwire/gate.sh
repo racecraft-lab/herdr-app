@@ -190,11 +190,12 @@ test_target() {
 # parse_cargo PKGDIR LOG: append the targets that ran to ran.txt and every
 # passed test to ok.txt (PKGDIR, target, test name). Ignored tests are not ok.
 parse_cargo() {
-  awk -v pd="$1" -v ran="$rd/ran.txt" -v ok="$rd/ok.txt" '
+  awk -v pd="$1" -v ran="$rd/ran.txt" -v ok="$rd/ok.txt" -v counts="$rd/counts.txt" '
     /^[[:space:]]*Running / { t = $0; sub(/^[[:space:]]*Running /, "", t); sub(/ \(.*$/, "", t); print pd "\t" t >> ran; cur = t; next }
     /^test .* \.\.\. ok$/ { n = $0; sub(/^test /, "", n); sub(/ \.\.\. ok$/, "", n); print pd "\t" cur "\t" n >> ok }
+    /^test result: / { print pd "\t" cur "\t" $4 >> counts }
   ' "$2"
-  touch "$rd/ran.txt" "$rd/ok.txt"
+  touch "$rd/ran.txt" "$rd/ok.txt" "$rd/counts.txt"
 }
 
 # passed_test FILE SCOPE: is the definition SCOPE in FILE a test that passed in
@@ -312,11 +313,27 @@ reach() {
   return 1
 }
 
-is_test_def() { # FILE START_LINE CHAIN_HAS_TESTS_MODULE
-  [ "$3" = 1 ] && return 0
+# is_test_def FILE START_LINE: test code by place (tests/, benches/) or by an
+# attribute on the definition itself: #[test], #[x::test], #[cfg(test)]. Only
+# the attribute and comment block right above START_LINE counts; the first
+# other line ends it, so an attribute on an earlier item never leaks down.
+is_test_def() {
   case $(pkgrel "$1") in tests/*|benches/*) return 0 ;; esac
-  td_from=$(( $2 > 6 ? $2 - 6 : 1 ))
-  sed -n "${td_from},$(( $2 - 1 ))p" "$1" 2>/dev/null | grep -Eq '#\[([A-Za-z_][A-Za-z0-9_]*::)*test(\(|\])|#\[cfg\(test\)\]'
+  [ "$2" -gt 1 ] || return 1
+  head -n "$(( $2 - 1 ))" "$1" 2>/dev/null | awk '
+    { a[NR] = $0 }
+    END {
+      for (i = NR; i >= 1; i--) {
+        l = a[i]
+        if (l ~ /^[[:space:]]*$/ || l ~ /^[[:space:]]*\/\//) continue
+        if (l ~ /^[[:space:]]*#\[/) {
+          if (l ~ /#\[([A-Za-z_][A-Za-z0-9_]*::)*test(\(|\])/ || l ~ /#\[cfg\(test\)\]/) found = 1
+          continue
+        }
+        break
+      }
+      exit !found
+    }'
 }
 
 # untested_step LABEL RWROOT PREFIX FILES: the changed definitions of one root.
@@ -361,7 +378,7 @@ untested_step() {
           echo "$us_f:$h_l (in $(tail -1 "$rd/at.txt" | cut -f1,2 | tr '\t' ' '), not a function)" >> "$rd/outside-$us_label.txt"; continue
         fi
         skip_to=$d_el
-        if is_test_def "$us_f" "$d_l" 0; then kind="test"; else kind="code"; fi
+        if is_test_def "$us_f" "$d_l"; then kind="test"; else kind="code"; fi
         echo "$kind	$us_f	$d_l	$d_n	$d_t" >> "$rd/defs-$us_label.txt"
       done
     done
@@ -449,7 +466,13 @@ tests_step() {
         tests/*.rs)
           r_t=$(test_target "$r_rel")
           if awk -F'\t' -v pd="$r_pd" -v t="$r_t" '$1 == pd && $2 == t { f = 1 } END { exit !f }' "$rd/ran.txt"; then
-            echo "  ran   $r_f: in cargo test (\"Running $r_t\" in the log); it passes only with the suite above"
+            r_n=$(awk -F'\t' -v pd="$r_pd" -v t="$r_t" '$1 == pd && $2 == t { print $3; exit }' "$rd/counts.txt")
+            case $r_n in
+              "") r_note="harness = false, so cargo prints no test count" ;;
+              0) r_note="0 tests on this platform (cfg-gated), so it checked nothing here" ;;
+              *) r_note="$r_n passed" ;;
+            esac
+            echo "  ran   $r_f: in cargo test (\"Running $r_t\" in the log), $r_note; it passes only with the suite above"
           else
             echo "  FAIL  $r_f: named by ripwire, but cargo never ran it"; echo x >> "$rd/rowfail-$ts_label"
           fi ;;

@@ -94,6 +94,14 @@ Limits:
   including a changed branch that test never takes.
 - Ripwire records no call written inside a macro (`debug!(.., f())`) in code
   outside tests. A function called only that way reads as unreached.
+- Only Rust definitions are checked. A changed function in `scripts/*.ts` gets
+  no untested check, and ripwire's `<u>` rows leave changed symbols out, so
+  nothing else catches it either.
+- A changed line `ripwire --at` places in no definition goes to the printed
+  "changed lines in no function" list and does not block. Doc comments,
+  attributes and imports land there, and so would a line in a
+  `macro_rules!` body or in a file ripwire parsed with errors
+  (`parse_degraded="1"`). Read that list.
 - `vendor/gpui-kit` crates cannot be tested from this checkout. Cargo refuses
   `cargo test -p gpui-base` ("requires dev-dependencies and is not a member of
   the workspace"), and the kit has no `Cargo.lock` for `--locked`. A branch
