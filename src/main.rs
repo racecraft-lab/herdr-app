@@ -5,6 +5,7 @@ mod bench;
 mod commands;
 mod control;
 mod core_bin;
+mod drops;
 mod files;
 mod hc;
 mod keys;
@@ -117,8 +118,7 @@ fn main() {
     }
 
     telemetry::clock();
-    #[cfg(target_os = "macos")]
-    terminal::prune_drops_hourly();
+    drops::start();
     // A first start sizes the app to the screen and the system's text size.
     let fresh = !settings::path().exists();
     // The core people installed; without one, the setup screen installs it.
