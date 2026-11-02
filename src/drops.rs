@@ -31,9 +31,13 @@ mod mac {
 
     /// Hourly, while the app runs, removes day-old copies.
     pub fn start() {
-        std::thread::spawn(|| loop {
-            let _ = prune(&dir());
-            std::thread::sleep(std::time::Duration::from_secs(3600));
+        prune_every(dir(), std::time::Duration::from_secs(3600));
+    }
+
+    fn prune_every(dir: PathBuf, every: std::time::Duration) {
+        std::thread::spawn(move || loop {
+            let _ = prune(&dir);
+            std::thread::sleep(every);
         });
     }
 
@@ -201,6 +205,31 @@ mod mac {
             assert!(!drops.join("herdr-drop-1.png").exists(), "a day-old copy goes");
             assert!(fresh.exists() && drops.join("other.png").exists(), "fresh copies and other files stay");
             let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn the_pruner_keeps_running_and_removes_day_old_copies() {
+            let root = scratch("pruner");
+            let drops = root.join("drops");
+            std::fs::create_dir(&drops).unwrap();
+            std::fs::set_permissions(&drops, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+            let old = drops.join("herdr-drop-1.png");
+            let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400);
+            std::fs::File::create(&old).unwrap().set_modified(two_days_ago).unwrap();
+            super::prune_every(drops.clone(), std::time::Duration::from_millis(10));
+            let gone = (0..200).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                !old.exists()
+            });
+            assert!(gone, "the pruner removed the day-old copy");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn other_drops_pass_through_untouched() {
+            let plain = std::path::PathBuf::from("/Users/me/Desktop/a b.png");
+            assert_eq!(super::stage(vec![plain.clone()]), [plain]);
+            assert!(super::dir().ends_with("herdr-drops"));
         }
 
         #[test]
