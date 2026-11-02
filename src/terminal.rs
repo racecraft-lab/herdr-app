@@ -462,8 +462,8 @@ impl TerminalView {
     /// gets each file copied there first (`hc put`), and its path there.
     fn dropped(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
         if !self.address.contains('/') {
-            let paths = if cfg!(target_os = "macos") { stage_screenshot_drops(paths, &std::env::temp_dir()) } else { paths };
-            let text = quote_paths(paths.iter().map(|p| p.to_string_lossy().into_owned()));
+            let dir = std::env::temp_dir().join("herdr-drops");
+            let text = local_drop_text(paths, &dir, |p| cfg!(target_os = "macos") && is_screenshot_thumbnail(p));
             let bytes = self.grid.borrow().vt.paste_bytes(&text);
             return self.send(&bytes);
         }
@@ -744,41 +744,83 @@ pub(crate) fn shown_title(title: &str) -> &str {
     if rest.is_empty() || !title[..led].chars().any(spinner) || !title[..led].ends_with(char::is_whitespace) { title } else { rest }
 }
 
-/// A live macOS screenshot thumbnail dragged before macOS saves it: a file in
-/// `.../TemporaryItems/NSIRD_screencaptureui_*/`. macOS lets only the process
-/// that received the drop read it, so it must be copied from here.
+/// A file in a macOS sandboxed drag folder, `.../TemporaryItems/NSIRD_*/`
+/// (a live screenshot thumbnail, say). macOS lets only the process that
+/// received the drop read it, so it must be copied from here.
 fn is_screenshot_thumbnail(path: &std::path::Path) -> bool {
     let parts: Vec<_> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
-    parts.windows(2).any(|w| w[0] == "TemporaryItems" && w[1].starts_with("NSIRD_screencaptureui_"))
+    parts.windows(2).any(|w| w[0] == "TemporaryItems" && w[1].starts_with("NSIRD_"))
 }
 
-/// Screenshot thumbnails copied by this process into `dest`, other paths as
-/// they were. A thumbnail that can't be copied keeps its original path.
-fn stage_screenshot_drops(paths: Vec<PathBuf>, dest: &std::path::Path) -> Vec<PathBuf> {
-    paths
-        .into_iter()
-        .map(|p| {
-            if !is_screenshot_thumbnail(&p) {
-                return p;
-            }
-            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let copy = dest.join(format!("herdr-drop-{stamp}-{name}"));
-            // Read here, in the app, which holds the drop's access; the core can't.
-            // create_new: never overwrite or follow an existing file at `copy`.
-            let written = std::fs::read(&p).and_then(|bytes| {
-                use std::io::Write;
-                std::fs::OpenOptions::new().write(true).create_new(true).open(&copy)?.write_all(&bytes)
-            });
-            match written {
-                Ok(()) => copy,
-                Err(e) => {
-                    tracing::warn!("cannot copy dropped screenshot {}: {e}", p.display());
-                    p
-                }
-            }
+/// Dropped paths typed in locally: each `staged` one swapped for a copy made
+/// here (or kept if that fails), and any with a control character skipped.
+fn local_drop_text(paths: Vec<PathBuf>, dir: &std::path::Path, staged: impl Fn(&std::path::Path) -> bool) -> String {
+    let paths = paths.into_iter().map(|p| {
+        if !staged(&p) {
+            return p;
+        }
+        copy_into(&p, dir, 256 << 20).unwrap_or_else(|e| {
+            tracing::warn!("cannot copy dropped file {}: {e}", p.display());
+            p
         })
-        .collect()
+    });
+    let safe = paths.map(|p| p.to_string_lossy().into_owned()).filter(|p| {
+        let bad = p.chars().any(char::is_control);
+        if bad {
+            tracing::warn!("skipping a dropped path with a control character: {p:?}");
+        }
+        !bad
+    });
+    quote_paths(safe)
+}
+
+/// Copies `src` into `dir` (ours, 0700) as `herdr-drop-<nanos>[.ext]`, 0600,
+/// first pruning day-old copies there. Refuses links, non-files and files over
+/// `cap` bytes, leaving no partial copy.
+#[cfg(target_os = "macos")]
+fn copy_into(src: &std::path::Path, dir: &std::path::Path, cap: u64) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind, Read};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(dir)
+        && e.kind() != ErrorKind::AlreadyExists
+    {
+        return Err(e);
+    }
+    let d = std::fs::symlink_metadata(dir)?;
+    if !d.is_dir() || d.uid() != unsafe { libc::geteuid() } {
+        return Err(Error::other("drop folder is not our own directory"));
+    }
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let old = e.metadata().ok().filter(|m| m.is_file()).and_then(|m| m.modified().ok()?.elapsed().ok());
+        if e.file_name().to_string_lossy().starts_with("herdr-drop-") && old.is_some_and(|a| a.as_secs() > 86_400) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    // Read here, in the app, which holds the drop's access; the core can't.
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(src)?;
+    let ext = src.extension().and_then(|e| e.to_str()).filter(|e| e.len() <= 8 && e.bytes().all(|b| b.is_ascii_alphanumeric()));
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let mut dest = dir.join(format!("herdr-drop-{stamp}"));
+    if let Some(ext) = ext {
+        dest.set_extension(ext);
+    }
+    let mut out = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&dest)?;
+    let copied = file.metadata().and_then(|m| {
+        if !m.is_file() || m.len() > cap {
+            return Err(Error::other("not a regular file under the size cap"));
+        }
+        let n = std::io::copy(&mut file.take(cap + 1), &mut out)?;
+        if n > cap { Err(Error::other("file grew past the size cap")) } else { Ok(dest.clone()) }
+    });
+    if copied.is_err() {
+        let _ = std::fs::remove_file(&dest);
+    }
+    copied
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_into(_: &std::path::Path, _: &std::path::Path, _: u64) -> std::io::Result<PathBuf> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// Paths as a shell reads them, space-separated with a trailing space: bare
@@ -1664,7 +1706,7 @@ mod tests {
     #[test]
     fn screenshot_thumbnail_paths_are_recognised() {
         assert!(super::is_screenshot_thumbnail(Path::new(THUMB)));
-        assert!(super::is_screenshot_thumbnail(Path::new("/T/TemporaryItems/NSIRD_screencaptureui_x/a.png")));
+        assert!(super::is_screenshot_thumbnail(Path::new("/T/TemporaryItems/NSIRD_other_x/a.png")));
     }
 
     #[test]
@@ -1673,7 +1715,8 @@ mod tests {
             "/Users/me/Desktop/Screenshot 2026-11-02 at 3.10.04\u{202f}PM.png",
             "/var/folders/ab/T/TemporaryItems/other/a.png",
             "/var/folders/ab/T/NSIRD_screencaptureui_x/a.png",
-            "/var/folders/ab/T/TemporaryItems/xNSIRD_screencaptureui_x/a.png",
+            "/var/folders/ab/T/TemporaryItems/xNSIRD_x/a.png",
+            "/var/folders/ab/T/TemporaryItems/sub/NSIRD_x/a.png",
             "NSIRD_screencaptureui_x/TemporaryItems/a.png",
             "",
         ] {
@@ -1681,26 +1724,87 @@ mod tests {
         }
     }
 
-    #[test]
-    fn screenshot_drops_are_copied_and_other_drops_kept() {
-        let root = std::env::temp_dir().join(format!("herdr-drop-test-{}", std::process::id()));
-        let thumb_dir = root.join("TemporaryItems/NSIRD_screencaptureui_t");
-        std::fs::create_dir_all(&thumb_dir).unwrap();
-        let dest = root.join("out");
-        std::fs::create_dir_all(&dest).unwrap();
-        let thumb = thumb_dir.join("Screenshot 3.10.04\u{202f}PM.png");
-        std::fs::write(&thumb, b"png-bytes").unwrap();
-        let finder = root.join("report.txt");
-        std::fs::write(&finder, b"x").unwrap();
-        let gone = thumb_dir.join("missing.png");
+    /// A fresh scratch directory; never named `TemporaryItems`, which macOS won't let us remove.
+    #[cfg(target_os = "macos")]
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("herdr-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
 
-        let out = super::stage_screenshot_drops(vec![thumb.clone(), finder.clone(), gone.clone()], &dest);
-        assert_eq!(out.len(), 3);
-        assert!(out[0].starts_with(&dest) && out[0].to_string_lossy().ends_with("Screenshot 3.10.04\u{202f}PM.png"));
-        assert_eq!(std::fs::read(&out[0]).unwrap(), b"png-bytes");
-        assert_eq!(out[1], finder);
-        assert_eq!(out[2], gone, "an unreadable thumbnail keeps its path");
-        // macOS refuses to remove a directory named TemporaryItems; the files go, the empty tree may stay.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copy_into_makes_a_private_safely_named_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("copy");
+        let drops = root.join("drops");
+        let src = root.join("a\nb; rm -rf ~.png");
+        std::fs::write(&src, b"png-bytes").unwrap();
+        let copy = super::copy_into(&src, &drops, 1024).unwrap();
+        let name = copy.file_name().unwrap().to_str().unwrap();
+        assert!(copy.starts_with(&drops) && name.strip_prefix("herdr-drop-").and_then(|n| n.strip_suffix(".png")).is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())), "{name}");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"png-bytes");
+        assert_eq!(std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&drops).unwrap().permissions().mode() & 0o777, 0o700);
+        let odd = root.join("x.p$g");
+        std::fs::write(&odd, b"x").unwrap();
+        assert!(super::copy_into(&odd, &drops, 1024).unwrap().extension().is_none(), "an unsafe extension is dropped");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copy_into_refuses_links_fifos_and_big_files_without_leftovers() {
+        let root = scratch("refuse");
+        let drops = root.join("drops");
+        let real = root.join("real.png");
+        std::fs::write(&real, b"0123456789").unwrap();
+        let link = root.join("link.png");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let fifo = root.join("fifo.png");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(super::copy_into(&link, &drops, 1024).is_err(), "symlink");
+        assert!(super::copy_into(&fifo, &drops, 1024).is_err(), "fifo, without blocking on a writer");
+        assert!(super::copy_into(&real, &drops, 9).is_err(), "over the cap");
+        assert_eq!(std::fs::read_dir(&drops).unwrap().count(), 0, "no partial copy is left");
+        let fake = root.join("fake-drops");
+        std::os::unix::fs::symlink(&drops, &fake).unwrap();
+        assert!(super::copy_into(&real, &fake, 1024).is_err(), "a symlinked drop folder");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copy_into_prunes_only_day_old_copies() {
+        let root = scratch("prune");
+        let drops = root.join("drops");
+        let src = root.join("a.png");
+        std::fs::write(&src, b"x").unwrap();
+        let fresh = super::copy_into(&src, &drops, 1024).unwrap();
+        let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400);
+        for name in ["herdr-drop-1.png", "other.png"] {
+            std::fs::File::create(drops.join(name)).unwrap().set_modified(two_days_ago).unwrap();
+        }
+        super::copy_into(&src, &drops, 1024).unwrap();
+        assert!(!drops.join("herdr-drop-1.png").exists(), "a day-old copy goes");
+        assert!(fresh.exists() && drops.join("other.png").exists(), "fresh copies and other files stay");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn local_drops_paste_copies_and_skip_control_characters() {
+        let root = scratch("wiring");
+        let drops = root.join("drops");
+        let thumb = root.join("shot.png");
+        std::fs::write(&thumb, b"x").unwrap();
+        let (plain, evil) = (root.join("a b.txt"), root.join("x\n.txt"));
+        let text = super::local_drop_text(vec![thumb.clone(), plain.clone(), evil], &drops, |p| p == thumb);
+        let copy = std::fs::read_dir(&drops).unwrap().next().unwrap().unwrap().path();
+        let quoted = |p: &Path| p.to_string_lossy().into_owned();
+        assert_eq!(text, super::quote_paths([quoted(&copy), quoted(&plain)]));
         let _ = std::fs::remove_dir_all(&root);
     }
 
