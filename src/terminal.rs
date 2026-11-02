@@ -747,8 +747,8 @@ pub(crate) fn shown_title(title: &str) -> &str {
 /// (a live screenshot thumbnail, say). macOS lets only the process that
 /// received the drop read it, so it must be copied from here.
 fn is_screenshot_thumbnail(path: &std::path::Path) -> bool {
-    let parts: Vec<_> = path.components().map(|c| c.as_os_str()).collect();
-    parts.windows(2).any(|w| w[0] == "TemporaryItems" && w[1].as_encoded_bytes().starts_with(b"NSIRD_"))
+    let next = path.components().skip(1);
+    path.components().zip(next).any(|(a, b)| a.as_os_str() == "TemporaryItems" && b.as_os_str().as_encoded_bytes().starts_with(b"NSIRD_"))
 }
 
 /// Where dropped screenshots are copied, for the core's programs to read.
