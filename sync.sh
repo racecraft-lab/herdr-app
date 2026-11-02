@@ -37,6 +37,7 @@ files=".ripwire_arch_rules
 .ripwire_arch_baseline
 .ripwire_notes
 .ripwire_quality_acks
+.ripwire_untested_acks
 .ripwire/gate.sh
 .ripwire/gpui-kit/.ripwire_arch_rules
 .ripwire/gpui-kit/.ripwire_arch_baseline
@@ -47,6 +48,7 @@ excludes="/.ripwire_arch_rules
 /.ripwire_arch_baseline
 /.ripwire_notes
 /.ripwire_quality_acks
+/.ripwire_untested_acks
 /.ripwire_quality_baseline
 /.ripwire/
 /AGENTS.local.md

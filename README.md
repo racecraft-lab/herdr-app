@@ -27,7 +27,8 @@ too. Updates to tracked files commit normally; a new file (such as a first
 | `.ripwire_arch_baseline` | checkout root | Accepted debt on upstream master (none) |
 | `.ripwire/gpui-kit/.ripwire_arch_rules` | same path | `vendor/gpui-kit` crate layering |
 | `.ripwire/gpui-kit/.ripwire_arch_baseline` | same path | Its accepted debt (none) |
-| `.ripwire/gate.sh` | same path | Pre-PR gate: doctor, arch, quality-delta, test-gate |
+| `.ripwire/gate.sh` | same path | Pre-PR gate: doctor, arch, quality-delta, tests, untested code |
+| `.ripwire_untested_acks` | checkout root (none yet) | Changed functions the maintainer accepts without a test, one `PATH:NAME<TAB>reason` per line |
 | `.ripwire_notes` | checkout root | Field notes surfaced on matching files |
 | `AGENTS.local.md`, `CLAUDE.local.md` | checkout root | Agent workflow; Claude Code import |
 | `upstream-master/.ripwire_quality_baseline` | only a checkout at its pinned commit | Quality floor of upstream master |
@@ -45,11 +46,60 @@ form of each:
 
 - `--quality-delta=<merge-base>..HEAD` over all 12 kinds: no `--quality-kinds`,
   no `--scope`, no `.ripwire_quality_acks`.
-- `--test-gate=<changed files>` with exit 4 treated as a failure.
+- `--test-gate=<changed files>`, whose exit 4 the gate discharges with
+  evidence instead of reading it as a failure (next section).
 - `--arch` against empty baselines, for both roots.
 - `--lint --naming-locals` with every built-in rule (no `--lint-select`, no
   `--lint-ignore`), `--doc-drift --with-history`, `--dead-code`, `--clones`
   and `--quality-panel=strict`. These exit 0 by design and are reports only.
+
+## How the gate discharges `--test-gate`
+
+`--test-gate` exits 4 whenever the change has any test to run or any impacted
+symbol no test reaches, so on its own it fails nearly every branch. The gate
+keeps both obligations and turns each into a check that needs evidence:
+
+- **tests** (`<t>`/`<g>` rows). The gate runs `cargo test --locked
+  --no-fail-fast`, the whole suite, and fails if it fails. Each test file
+  ripwire names must then show up in that run: `tests/X.rs` as cargo's
+  `Running tests/X.rs` line (the harness = false targets included), a
+  `*.test.ts` file through `bun test`, or a row's `run=` command. A row with
+  none of these fails as "no runner".
+- **untested code**. For each changed line, `ripwire --at` names the function
+  or method around it. Each one that is not test code must be reached by a
+  test that passed in that run. Ripwire has no call edges out of in-file
+  `#[cfg(test)]` modules, so the gate looks for the call itself:
+  `ripwire --regex` finds the call sites of the name, and a site counts when
+  its enclosing definition is a passed cargo test, in the same file or through
+  `module::name`. Failing and ignored tests do not count. The gate then walks
+  up `ripwire --callers` through resolved edges only, so a test that calls a
+  caller also counts. Name-only edges are skipped, because they credit
+  `tests/shot_pixels.rs` with code in `src/terminal.rs` it cannot call.
+  `src/main.rs::main` counts as reached when a passed test spawns the binary
+  (`CARGO_BIN_EXE_herdr-app`), which ripwire does not model; that credit stops
+  at `main` and does not pass to its callees.
+- The `<u>` rows are callers outside the change. Their gaps predate the
+  change, so they are listed in full in `.ripwire/out/untested-radius-app.txt`
+  and do not block.
+
+Every row the gate prints says how it was discharged: the test target that
+ran, or the passed test and call path that reaches each changed function.
+`.ripwire_untested_acks` accepts a named function without a test. Like
+`--quality-ack`, an entry is the maintainer's call, in its own reviewed commit
+here, and the gate prints its reason. The file does not exist yet.
+
+Limits:
+
+- Reach is per function. A test that calls a function credits all of it,
+  including a changed branch that test never takes.
+- Ripwire records no call written inside a macro (`debug!(.., f())`) in code
+  outside tests. A function called only that way reads as unreached.
+- `vendor/gpui-kit` crates cannot be tested from this checkout. Cargo refuses
+  `cargo test -p gpui-base` ("requires dev-dependencies and is not a member of
+  the workspace"), and the kit has no `Cargo.lock` for `--locked`. A branch
+  that touches the kit therefore fails `tests-kit` until that changes.
+- A caller that lost its only tested path, because a changed function stopped
+  calling it, is not detected.
 
 ## Regenerating after a ripwire upgrade or a rules change
 

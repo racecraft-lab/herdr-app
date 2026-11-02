@@ -18,6 +18,7 @@ a flag you have not used here. Add `--legend=compact` to every XML verb.
 | `.ripwire/gpui-kit/` | The same pair for `vendor/gpui-kit`, which runs as its own root |
 | `.ripwire_notes` | Field notes that `--for`, `--expand` and `--edit-check` surface |
 | `.ripwire/gate.sh` | The pre-PR gate below, at the strictest settings |
+| `.ripwire_untested_acks` | Changed functions the maintainer accepts without a test (none yet) |
 | `CLAUDE.local.md` | Imports `AGENTS.md` and this file for Claude Code |
 
 There is no quality baseline here on purpose. Ripwire honors one only at the
@@ -60,14 +61,26 @@ It fails (exit 1) when any of these fails:
 - `ripwire . --quality-delta=<merge-base>..HEAD`: all 12 kinds, no `--scope`,
   no acks (exit 2 = existing code got worse). The same for `vendor/gpui-kit`
   when the branch touches it.
-- `ripwire . --test-gate=<changed files>` (exit 4 = tests to run or untested
-  blast radius). The same for `vendor/gpui-kit` when touched.
+- `tests-app`: `ripwire . --test-gate=<changed files>` names test files to
+  run. The gate runs `cargo test --locked --no-fail-fast` itself, and fails if
+  the suite fails or if a named file did not run in it (or has no runner).
+- `untested-app`: every function or method the change adds or edits must be
+  reached by a test that passed in that run. The gate prints the test and
+  call path for each, or `FAIL` with how far it searched.
+- The same two for `vendor/gpui-kit` when touched. Its crates cannot be
+  tested from this checkout yet, so that step fails closed.
 
-`--test-gate` exit 4 is blocking by policy. Discharge it by running the named
-tests and the whole suite (`just test`: the bun script tests plus
-`cargo test --locked`), then say in the PR which tests ran. Ripwire does not model in-file `#[cfg(test)]` unit
-tests as tests here, so it names only `tests/*.rs` targets and reports new
-`#[test]` functions as new-symbol `dead-code`. Those rows never gate.
+Ripwire does not model in-file `#[cfg(test)]` unit tests as tests here. It
+names only `tests/*.rs` targets, and it reports new `#[test]` functions as
+new-symbol `dead-code`, which never gates. The gate makes up for this: a
+passed cargo test that calls the function counts. So when `untested-app`
+fails, add a unit test that calls the function (or a tested caller of it).
+`README.md` on the tooling branch lists what the check cannot see.
+
+The `<u>` rows (impacted callers no test reaches) are outside the change and
+do not block; the full list is in `.ripwire/out/untested-radius-app.txt`.
+The gate does not run the bun script tests unless ripwire names one, so run
+`just test` too, and say in the PR which tests ran.
 
 `--quality-delta` exit 0 means nothing that already existed got worse. It
 does not mean no new debt: read every `origin="new-symbol"` row, and fix
@@ -78,8 +91,9 @@ them by design; read them and fix what your branch added:
 `--lint --naming-locals` (every built-in rule), `--dead-code`, `--clones`,
 `--doc-drift --with-history` and `--quality-panel=strict`.
 
-Never acknowledge a finding to pass the gate. `--quality-ack` is for debt the
-maintainer accepted, in its own reviewed commit on `racecraft/tooling`.
+Never acknowledge a finding to pass the gate. `--quality-ack` and
+`.ripwire_untested_acks` are for debt the maintainer accepted, in its own
+reviewed commit on `racecraft/tooling`.
 
 ## What ripwire cannot see here
 
