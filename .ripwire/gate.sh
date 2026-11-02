@@ -32,6 +32,8 @@ root=$(git rev-parse --show-toplevel) || exit 1
 cd "$root" || exit 1
 out="$root/.ripwire/out"
 mkdir -p "$out"
+# Never report a previous run's result for a check this run skips.
+rm -f "$out"/*.xml "$out"/*.txt
 
 for f in .ripwire_arch_rules .ripwire_arch_baseline .ripwire/gpui-kit/.ripwire_arch_rules .ripwire/gpui-kit/.ripwire_arch_baseline; do
   if [ ! -f "$f" ]; then
@@ -49,12 +51,15 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   echo "gate: warning: tracked files have uncommitted changes; they are NOT measured" >&2
 fi
 
-# Changed files on the branch, split by ripwire root, kept only when they
-# still exist at HEAD and carry an extension ripwire indexes here.
-indexed_ext='\.(rs|js|mjs|ts|mts|cts|tsx|py|sh|json|toml|ya?ml|md)$'
+# Changed files on the branch that still exist at HEAD, split by ripwire
+# root. --test-gate refuses a file the index lacks, so drop every path that
+# `ripwire --skipped` lists (unsupported type, oversize, excluded). vendor/
+# is pruned from the app root; vendor/gpui-kit is checked as its own root.
 git diff --name-only --diff-filter=d "$merge_base" HEAD > "$out/changed.txt"
-app_files=$(grep -v '^vendor/' "$out/changed.txt" | grep -E "$indexed_ext" | paste -sd, -)
-kit_files=$(grep '^vendor/gpui-kit/' "$out/changed.txt" | sed 's#^vendor/gpui-kit/##' | grep -E "$indexed_ext" | paste -sd, -)
+ripwire . --skipped --legend=compact 2>/dev/null | grep -o '<f p="[^"]*"' | sed 's/^<f p="//; s/"$//' > "$out/skipped-app.txt"
+ripwire vendor/gpui-kit --skipped --legend=compact 2>/dev/null | grep -o '<f p="[^"]*"' | sed 's/^<f p="//; s/"$//' > "$out/skipped-kit.txt"
+app_files=$(grep -v '^vendor/' "$out/changed.txt" | grep -vxF -f "$out/skipped-app.txt" | paste -sd, -)
+kit_files=$(grep '^vendor/gpui-kit/' "$out/changed.txt" | sed 's#^vendor/gpui-kit/##' | grep -vxF -f "$out/skipped-kit.txt" | paste -sd, -)
 other_vendor=$(grep '^vendor/' "$out/changed.txt" | grep -v '^vendor/gpui-kit/' | paste -sd' ' -)
 
 failed=0

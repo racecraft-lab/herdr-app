@@ -15,6 +15,10 @@ names to the checkout's `.git/info/exclude`. `./sync.sh pull` brings back the
 sidecars ripwire writes (`.ripwire_notes`, arch baselines, quality acks).
 The workflow for agents is in `AGENTS.local.md`.
 
+All worktrees share one `.git/info/exclude`, and it hides these names here
+too. Updates to tracked files commit normally; a new file (such as a first
+`.ripwire_quality_acks`) needs `git add -f`.
+
 ## Files
 
 | Path | Synced to | Enforces |

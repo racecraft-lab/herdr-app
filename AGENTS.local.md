@@ -99,7 +99,9 @@ The source of truth is the `racecraft/tooling` branch, checked out at
 - `./sync.sh status` shows what differs from this checkout.
 - `./sync.sh pull` copies sidecars ripwire wrote here (`--note-add`,
   `--baseline-update`, `--quality-ack`) back to the tooling worktree. Commit
-  them on `racecraft/tooling` and push to `origin`.
+  them on `racecraft/tooling` and push to `origin`. Every worktree shares one
+  `.git/info/exclude` that hides these names, so a file the branch does not
+  track yet (such as a first `.ripwire_quality_acks`) needs `git add -f`.
 - `./sync.sh push [CHECKOUT]` copies tooling changes into a checkout. Pass the
   path for another worktree, such as `../herdr-app-fix`.
 - Regenerate baselines on a clean `upstream/master` worktree after a ripwire
