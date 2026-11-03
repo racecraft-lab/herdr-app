@@ -226,6 +226,22 @@ mod mac {
         }
 
         #[test]
+        fn start_prunes_the_real_drop_folder() {
+            use std::os::unix::fs::DirBuilderExt;
+            let dir = super::dir();
+            let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+            let old = dir.join(format!("herdr-drop-test-{}", std::process::id()));
+            let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400);
+            std::fs::File::create(&old).unwrap().set_modified(two_days_ago).unwrap();
+            super::start();
+            let gone = (0..200).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                !old.exists()
+            });
+            assert!(gone, "the pruner started at launch removed the day-old copy");
+        }
+
+        #[test]
         fn other_drops_pass_through_untouched() {
             let plain = std::path::PathBuf::from("/Users/me/Desktop/a b.png");
             assert_eq!(super::stage(vec![plain.clone()]), [plain]);

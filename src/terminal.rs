@@ -2040,6 +2040,19 @@ mod tests {
         assert_eq!(q(&["/tmp/it's.png"]), "'/tmp/it'\\''s.png' ");
     }
 
+    #[gpui::test]
+    fn a_file_dropped_on_a_local_terminal_is_typed_as_a_paste(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let (core, frames) = crate::hc::offline_recording();
+        let view = cx.new(|cx| super::TerminalView::attach(core, "t1".into(), (40, 5), cx));
+        let pasted = view.update(cx, |view, cx| {
+            view.grid.borrow_mut().channel = Some(7);
+            view.dropped(vec!["/tmp/my shot.png".into()], cx);
+            view.grid.borrow().vt.paste_bytes("'/tmp/my shot.png' ")
+        });
+        assert!(frames.try_iter().any(|f| f.ends_with(&pasted)), "the quoted path reached the terminal");
+    }
+
     #[test]
     fn local_drops_type_ordinary_paths_unchanged() {
         assert_eq!(super::local_paste(vec!["/tmp/my shot.png".into(), "/a/b".into()]), "'/tmp/my shot.png' /a/b ");
