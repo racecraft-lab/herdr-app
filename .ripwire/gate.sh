@@ -10,6 +10,9 @@
 # that is what cargo compiles and ripwire reads. Commit first, so both measure
 # the same code; the gate warns when they differ.
 #
+# Exit 0 = PASS, 1 = FAIL, 3 = INCOMPLETE (nothing failed, but changed code
+# compiled only for another OS was not tested here).
+#
 # BLOCKING checks (the gate exits 1 if any fails):
 #   doctor        ripwire --doctor                         exit 1 = unhealthy setup
 #   arch-app      --arch=.ripwire_arch_rules               exit 2 = new violation
@@ -29,11 +32,19 @@
 #                 reached by a test that passed in that run: a passed test that
 #                 calls it (`ripwire --regex` names the enclosing test; ripwire's
 #                 graph has no edges out of #[cfg(test)] modules), or that calls
-#                 one of its resolved callers, transitively (`ripwire --callers`;
-#                 name-only edges are ignored, because they credit tests that
-#                 cannot call the code). `main` also counts as reached when a
-#                 passed test spawns the binary (CARGO_BIN_EXE_*), which ripwire
-#                 does not model; that credit is not passed on to its callees.
+#                 one of its callers, transitively. A caller counts when ripwire
+#                 resolved the edge (`ripwire --callers`, minus name-only edges
+#                 and prov="split" arms, which credit tests that cannot call
+#                 the code), or when Rust's path rules bind the call site to it
+#                 (bare call in the same module, self::, super::, mod::, or the
+#                 file's module with a `pub use` re-export). `main` also counts
+#                 as reached when a passed test spawns the binary
+#                 (CARGO_BIN_EXE_*), which ripwire does not model; that credit
+#                 is not passed on to its callees. A definition whose cfg(...)
+#                 is false on this host (cfg(not(target_os = "macos")) on a Mac)
+#                 cannot be compiled, so no local run can test it: it is an
+#                 OTHER-OS row, neither ok nor FAIL, and the gate ends
+#                 INCOMPLETE (exit 3) unless something failed.
 #                 An entry in .ripwire_untested_acks (`PATH:NAME<TAB>reason`,
 #                 maintainer-reviewed commits on racecraft/tooling only) is
 #                 printed with its reason and does not block. Ripwire's <u> rows
@@ -96,6 +107,7 @@ kit_files=$(grep '^vendor/gpui-kit/' "$out/changed.txt" | sed 's#^vendor/gpui-ki
 other_vendor=$(grep '^vendor/' "$out/changed.txt" | grep -v '^vendor/gpui-kit/' | paste -sd' ' -)
 
 failed=0
+incomplete=0
 summary=""
 record() { # name rc pass_codes
   name=$1; rc=$2; ok=0
@@ -104,8 +116,8 @@ record() { # name rc pass_codes
   summary="$summary
   $name: exit $rc ($verdict)"
 }
-verdict() { # name pass|FAIL detail
-  [ "$2" = pass ] || failed=1
+verdict() { # name pass|INCOMPLETE|FAIL detail
+  case $2 in pass) ;; INCOMPLETE) incomplete=1 ;; *) failed=1 ;; esac
   summary="$summary
   $1: $2 ($3)"
 }
@@ -150,7 +162,7 @@ rows() {
           v = ""
           if (match(e, " " A[k] "=\"[^\"]*\"")) v = substr(e, RSTART + length(A[k]) + 3, RLENGTH - length(A[k]) - 4)
           gsub(/&lt;/, "<", v); gsub(/&gt;/, ">", v); gsub(/&quot;/, "\"", v); gsub(/&apos;/, "\047", v); gsub(/&amp;/, "\\&", v)
-          line = line (k > 1 ? "\t" : "") v
+          line = line (k > 1 ? "\t" : "") (v == "" ? "-" : v)
         }
         print line
       } }'
@@ -227,12 +239,12 @@ passed_test() {
   return 1
 }
 
-# hits_for RWROOT PREFIX NAME: cached call sites of NAME (FILE, line,
-# enclosing definition, text), FILE repo-relative.
+# hits_for RWROOT PREFIX NAME: cached call sites and `fn NAME` lines of NAME
+# (FILE, line, enclosing definition, text), FILE repo-relative.
 hits_for() {
   hf_f="$rd/hits-$(printf '%s' "$1" | tr '/.' '__')-$3.txt"
   if [ ! -f "$hf_f" ]; then
-    ripwire "$1" --regex="(^|[^A-Za-z0-9_])${3}[[:space:]]*(::<[^>]*>)?\\(" --grep-in=any --limit=100000 --legend=compact 2>/dev/null < /dev/null > "$hf_f.xml"
+    ripwire "$1" --regex="(^|[^A-Za-z0-9_])${3}[[:space:]]*(::<[^>]*>)?\\(|fn[[:space:]]+${3}([^A-Za-z0-9_]|\$)" --grep-in=any --limit=100000 --legend=compact 2>/dev/null < /dev/null > "$hf_f.xml"
     grep -q 'capped="1"' "$hf_f.xml" && echo "capped" > "$hf_f.capped"
     awk '{ gsub(/<f p="/, "\n<f p=\""); gsub(/<hit l="/, "\n<hit l=\""); print }' "$hf_f.xml" | awk -v pre="$2" '
       /^<f p="/ { f = $0; sub(/^<f p="/, "", f); sub(/".*/, "", f); next }
@@ -240,24 +252,210 @@ hits_for() {
         i = ""; h = $0; sub(/<!\[CDATA\[.*/, "", h)
         if (match(h, / in="[^"]*"/)) i = substr(h, RSTART + 5, RLENGTH - 6)
         t = $0; sub(/^[^>]*><!\[CDATA\[/, "", t); sub(/\]\]><\/hit>.*/, "", t)
-        print pre f "\t" l "\t" i "\t" t }' > "$hf_f"
+        print pre f "\t" l "\t" (i == "" ? "-" : i) "\t" t }' > "$hf_f"
   fi
   echo "$hf_f"
 }
 
-# direct_test FILE LINE NAME RWROOT PREFIX: a passed test whose body calls NAME,
-# in FILE itself or through a path naming FILE's module (mod::NAME).
+# at_rows RWROOT PREFIX FILE LINE: cached `ripwire --at` chain at FILE:LINE,
+# one "name, kind, start, end" row per enclosing definition, outermost first.
+at_rows() {
+  ar_k="$rd/at-$(printf '%s_%s' "$3" "$4" | tr '/.' '__').txt"
+  [ -f "$ar_k" ] || ripwire "$1" --at="${3#"$2"}:$4" --legend=compact 2>/dev/null < /dev/null | rows s n t l el > "$ar_k"
+  echo "$ar_k"
+}
+# modchain ROWS: the inline modules (kind "other") around a location, a::b.
+modchain() { awk -F'\t' '$2 == "other" { c = c (c == "" ? "" : "::") $1 } END { print c }' "$1"; }
+
+# call_form TEXT NAME: how TEXT calls NAME: def, method, bare, "path P" or none.
+call_form() {
+  printf '%s\n' "$1" | awk -v nm="$2" '{
+    s = $0
+    while ((i = index(s, nm)) > 0) {
+      before = substr(s, 1, i - 1); after = substr(s, i + length(nm)); pc = substr(before, length(before), 1)
+      if (pc ~ /[A-Za-z0-9_]/ || after !~ /^[[:space:]]*(::<[^>]*>)?[[:space:]]*\(/) { s = after; continue }
+      if (before ~ /fn[[:space:]]+$/) { print "def"; exit }
+      if (pc == ".") { print "method"; exit }
+      if (before ~ /::$/) { b = before; sub(/::$/, "", b); if (match(b, /[A-Za-z0-9_]+$/)) print "path " substr(b, RSTART); else print "path"; exit }
+      print "bare"; exit
+    }
+    print "none" }'
+}
+
+# Host facts for cfg(...): target_os, target_family, target_arch.
+case $(uname -s) in Darwin) host_os=macos ;; Linux) host_os=linux ;; *) host_os=$(uname -s | tr '[:upper:]' '[:lower:]') ;; esac
+host_family=unix
+case $(uname -m) in arm64|aarch64) host_arch=aarch64 ;; *) host_arch=$(uname -m) ;; esac
+
+# cfg_eval PREDICATE: 1 if it holds on this host, 0 if not, u if unknown
+# (features and other keys the gate cannot read).
+cfg_eval() {
+  printf '%s\n' "$1" | awk -v os="$host_os" -v fam="$host_family" -v arch="$host_arch" '
+    function sk() { while (p <= n && substr(s, p, 1) ~ /[ \t]/) p++ }
+    function id(  st) { sk(); st = p; while (p <= n && substr(s, p, 1) ~ /[A-Za-z0-9_]/) p++; return substr(s, st, p - st) }
+    function qs(  st, v) { sk(); if (substr(s, p, 1) != "\"") return "\001"; p++; st = p; while (p <= n && substr(s, p, 1) != "\"") p++; v = substr(s, st, p - st); p++; return v }
+    function ev(  k, v, r, acc, sawu, c) {
+      k = id(); sk(); c = substr(s, p, 1)
+      if ((k == "not" || k == "all" || k == "any") && c == "(") {
+        p++
+        if (k == "not") { r = ev(); sk(); if (substr(s, p, 1) == ")") p++; return r == "u" ? "u" : (r == "1" ? "0" : "1") }
+        acc = (k == "all") ? "1" : "0"; sawu = 0
+        while (1) {
+          sk(); if (p > n) return "u"
+          if (substr(s, p, 1) == ")") { p++; break }
+          r = ev()
+          if (k == "all" && r == "0") acc = "0"
+          if (k == "any" && r == "1") acc = "1"
+          if (r == "u") sawu = 1
+          sk(); if (substr(s, p, 1) == ",") p++; else if (substr(s, p, 1) != ")") return "u"
+        }
+        if (k == "all") return acc == "0" ? "0" : (sawu ? "u" : "1")
+        return acc == "1" ? "1" : (sawu ? "u" : "0")
+      }
+      if (c == "=") {
+        p++; v = qs()
+        if (k == "target_os") return v == os ? "1" : "0"
+        if (k == "target_family") return v == fam ? "1" : "0"
+        if (k == "target_arch") return v == arch ? "1" : "0"
+        return "u"
+      }
+      if (k == "unix") return fam == "unix" ? "1" : "0"
+      if (k == "windows") return fam == "windows" ? "1" : "0"
+      if (k == "test" || k == "debug_assertions") return "1"
+      return "u"
+    }
+    { s = $0; n = length(s); p = 1; print ev() }'
+}
+
+# attr_cfgs FILE LINE: the cfg(...) predicates in the attribute block right above LINE.
+attr_cfgs() {
+  [ "$2" -gt 1 ] || return 0
+  head -n "$(( $2 - 1 ))" "$1" 2>/dev/null | awk '
+    { a[NR] = $0 }
+    END {
+      for (i = NR; i >= 1; i--) {
+        l = a[i]
+        if (l ~ /^[[:space:]]*$/ || l ~ /^[[:space:]]*\/\//) continue
+        if (l ~ /^[[:space:]]*#\[/) { if (match(l, /#\[cfg\(.*\)\]/)) print substr(l, RSTART + 6, RLENGTH - 8); continue }
+        break
+      }
+    }'
+}
+# file_cfgs FILE: its inner #![cfg(...)] and the cfg on each `mod NAME;` that
+# declares it, up to the crate root.
+file_cfgs() {
+  fc_f=$1
+  while :; do
+    sed -n '1,40p' "$fc_f" 2>/dev/null | sed -n 's/^[[:space:]]*#!\[cfg(\(.*\))\][[:space:]]*$/\1/p'
+    fc_pd=$(pkgdir "$fc_f"); fc_rel=$(pkgrel "$fc_f")
+    if [ "$fc_pd" = . ]; then fc_base=""; else fc_base="$fc_pd/"; fi
+    case $fc_rel in src/main.rs|src/lib.rs) return 0 ;; src/*.rs) ;; *) return 0 ;; esac
+    fc_m=${fc_rel#src/}; fc_m=${fc_m%.rs}; fc_m=${fc_m%/mod}; fc_name=${fc_m##*/}
+    case $fc_m in
+      */*) fc_par="${fc_base}src/${fc_m%/*}"; if [ -f "$fc_par.rs" ]; then fc_par="$fc_par.rs"; else fc_par="$fc_par/mod.rs"; fi ;;
+      *) fc_par="${fc_base}src/main.rs"; [ -f "$fc_par" ] || fc_par="${fc_base}src/lib.rs" ;;
+    esac
+    [ -f "$fc_par" ] || return 0
+    fc_l=$(grep -n -E "^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?mod[[:space:]]+${fc_name}[[:space:]]*;" "$fc_par" | head -1 | cut -d: -f1)
+    [ -n "$fc_l" ] && attr_cfgs "$fc_par" "$fc_l"
+    fc_f=$fc_par
+  done
+}
+# compiled RWROOT PREFIX FILE LINE: is the definition at FILE:LINE compiled on
+# this host? Prints 1, u (a cfg the gate cannot read), or "0<TAB>cfg(...)".
+compiled() {
+  cp_k="$rd/cfg-$(printf '%s_%s' "$3" "$4" | tr '/.' '__').txt"
+  if [ ! -f "$cp_k" ]; then
+    cp_at=$(at_rows "$1" "$2" "$3" "$4")
+    {
+      attr_cfgs "$3" "$4"
+      awk -F'\t' -v l="$4" '$2 == "other" && $3 < l { print $3 }' "$cp_at" | while read -r cp_ml; do attr_cfgs "$3" "$cp_ml"; done
+      file_cfgs "$3"
+    } > "$rd/cfgs.txt"
+    cp_res=1
+    while read -r cp_p; do
+      case $(cfg_eval "$cp_p") in
+        0) cp_res=$(printf '0\tcfg(%s)' "$cp_p"); break ;;
+        u) cp_res=u ;;
+      esac
+    done < "$rd/cfgs.txt"
+    printf '%s\n' "$cp_res" > "$cp_k"
+  fi
+  cat "$cp_k"
+}
+
+# def_info RWROOT PREFIX FILE LINE NAME: "free<TAB>chain" for the definition:
+# free=1 when it is a plain fn of its module (not an impl method), from the
+# scoped name ripwire gives its own definition line.
+def_info() {
+  di_chain=$(modchain "$(at_rows "$1" "$2" "$3" "$4")")
+  di_scoped=$(awk -F'\t' -v f="$3" -v l="$4" '$1 == f && $2 == l { print $3; exit }' "$(hits_for "$1" "$2" "$5")")
+  if [ "$di_scoped" = "$5" ] || { [ -n "$di_chain" ] && [ "$di_scoped" = "$di_chain::$5" ]; }; then di_free=1; else di_free=0; fi
+  printf '%s\t%s\n' "$di_free" "$di_chain"
+}
+
+# direct_test FILE LINE NAME RWROOT PREFIX FREE: a passed test whose body calls
+# NAME, in FILE itself or through a path naming FILE's module (mod::NAME). A
+# plain fn is never credited through a method call of the same name.
 direct_test() {
   dt_hits=$(hits_for "$4" "$5" "$3")
   dt_mod=$(modname "$1")
   while IFS="$tab" read -r h_f h_l h_in h_t; do
-    [ -n "$h_in" ] || continue
+    [ "$h_in" != - ] || continue
     if [ "$h_f" != "$1" ]; then
       case $h_t in *"$dt_mod::$3"*) ;; *) continue ;; esac
     fi
+    case $(call_form "$h_t" "$3") in def|none) continue ;; method) [ "$6" = 1 ] && continue ;; esac
     if dt_id=$(passed_test "$h_f" "$h_in"); then echo "$dt_id calls it at $h_f:$h_l"; return 0; fi
   done < "$dt_hits"
   return 1
+}
+
+# scope_callers RWROOT PREFIX FILE LINE NAME FREE CHAIN: callers of a plain fn
+# that Rust's path rules bind to it, read from its call sites. Ripwire's
+# resolver leaves many of these unbound (it reads fns in an inline `mod` as
+# methods). Prints "file, line, scoped name" per caller definition.
+#   bare NAME(..)      same file, same module, and the caller does not bind NAME itself
+#   self::NAME(..)     same file, same module
+#   super::NAME(..)    same file, a module directly inside NAME's module
+#   M::NAME(..)        same file, M the innermost module holding NAME
+#   F::NAME(..)        any file, F the file's module, and NAME at the file's top
+#                      level or re-exported there with `pub use M::{.., NAME}`
+scope_callers() {
+  [ "$6" = 1 ] || return 0
+  sc_hits=$(hits_for "$1" "$2" "$5")
+  sc_mod=$(modname "$3"); sc_last=${7##*::}
+  sc_reexp=0
+  if [ -n "$7" ] && grep -Eq "^[[:space:]]*pub(\([^)]*\))?[[:space:]]+use[[:space:]]+(self::)?$7::(\{([^}]*[^A-Za-z0-9_])?$5([^A-Za-z0-9_][^}]*)?\}|$5[[:space:]]*;)" "$3"; then sc_reexp=1; fi
+  while IFS="$tab" read -r h_f h_l h_in h_t; do
+    [ "$h_in" != - ] || continue
+    [ "$h_f" = "$3" ] && [ "$h_l" = "$4" ] && continue
+    sc_form=$(call_form "$h_t" "$5")
+    sc_p=""; case $sc_form in "path "*) sc_p=${sc_form#path } ;; esac
+    case $sc_form in
+      bare|"path self"|"path super") [ "$h_f" = "$3" ] || continue ;;
+      "path "*)
+        if [ "$sc_p" = "$sc_last" ] && [ -n "$7" ] && [ "$h_f" = "$3" ]; then :
+        elif [ "$sc_p" = "$sc_mod" ] && { [ -z "$7" ] || [ "$sc_reexp" = 1 ]; }; then :
+        else continue; fi ;;
+      *) continue ;;
+    esac
+    sc_at=$(at_rows "$1" "$2" "$h_f" "$h_l")
+    sc_cc=$(modchain "$sc_at")
+    sc_def=$(awk -F'\t' '$2 == "fn" || $2 == "method" { d = $1 "\t" $3 "\t" $4 } END { print d }' "$sc_at")
+    [ -n "$sc_def" ] || continue
+    sc_cl=$(printf '%s\n' "$sc_def" | cut -f2); sc_cel=$(printf '%s\n' "$sc_def" | cut -f3)
+    case $sc_form in
+      bare)
+        [ "$sc_cc" = "$7" ] || continue
+        sed -n "${sc_cl},${sc_cel}p" "$h_f" | grep -Eq "(let|let[[:space:]]+mut|fn)[[:space:]]+$5([^A-Za-z0-9_]|$)" && continue ;;
+      "path self") [ "$sc_cc" = "$7" ] || continue ;;
+      "path super")
+        case $sc_cc in *::*) sc_parent=${sc_cc%::*} ;; ?*) sc_parent="" ;; *) continue ;; esac
+        [ "$sc_parent" = "$7" ] || continue ;;
+    esac
+    printf '%s\t%s\t%s\n' "$h_f" "$sc_cl" "$h_in"
+  done < "$sc_hits"
 }
 
 # bin_spawn: a passed test in a tests/ target that runs this crate's binary.
@@ -267,15 +465,18 @@ bin_spawn() {
   awk '{ gsub(/<f p="/, "\n<f p=\""); gsub(/<hit l="/, "\n<hit l=\""); print }' "$rd/bin-spawn.xml" | awk '
     /^<f p="/ { f = $0; sub(/^<f p="/, "", f); sub(/".*/, "", f); next }
     /^<hit l="/ { l = $0; sub(/^<hit l="/, "", l); sub(/".*/, "", l); i = ""; h = $0; sub(/<!\[CDATA\[.*/, "", h)
-      if (match(h, / in="[^"]*"/)) i = substr(h, RSTART + 5, RLENGTH - 6); print f "\t" l "\t" i }' |
+      if (match(h, / in="[^"]*"/)) i = substr(h, RSTART + 5, RLENGTH - 6); print f "\t" l "\t" (i == "" ? "-" : i) }' |
   while IFS="$tab" read -r b_f b_l b_in; do
     case $b_f in tests/*) ;; *) continue ;; esac
     if b_id=$(passed_test "$b_f" "$b_in"); then echo "$b_id runs the binary ($b_f:$b_l)"; return 0; fi
   done
 }
 
-# reach RWROOT PREFIX FILE LINE NAME: search up the resolved callers of the
-# definition at FILE:LINE for a passed test. Prints the evidence; exit 0 =
+# reach RWROOT PREFIX FILE LINE NAME: search up the callers of the definition
+# at FILE:LINE for a passed test. A caller counts when ripwire resolved the
+# edge (not by name alone, not one arm of a split between same-named
+# definitions), or when Rust's path rules bind its call (scope_callers). A
+# caller compiled out on this host is skipped. Prints the evidence; exit 0 =
 # reached, 1 = no passed test reaches it, 2 = search capped.
 reach() {
   rc_q="$rd/queue"; rc_v="$rd/visited"
@@ -290,7 +491,8 @@ reach() {
     if [ "$rc_n" -gt 1 ] && rc_id=$(passed_test "$q_f" "$q_scope"); then
       echo "passed test $rc_id -> $q_chain"; return 0
     fi
-    if rc_id=$(direct_test "$q_f" "$q_l" "$q_name" "$1" "$2"); then
+    q_info=$(def_info "$1" "$2" "$q_f" "$q_l" "$q_name"); q_free=${q_info%%"$tab"*}; q_mc=${q_info#*"$tab"}
+    if rc_id=$(direct_test "$q_f" "$q_l" "$q_name" "$1" "$2" "$q_free"); then
       if [ "$rc_n" = 1 ]; then echo "$rc_id"; else echo "$rc_id; path $q_chain"; fi
       return 0
     fi
@@ -299,17 +501,21 @@ reach() {
     fi
     ripwire "$1" --callers="@${q_f#"$2"}:$q_l" --limit=100000 --legend=compact < /dev/null > "$rd/callers.xml" 2>&1 ||
       echo "  (ripwire --callers=@${q_f#"$2"}:$q_l refused: $(head -c 200 "$rd/callers.xml"))" >&2
-    rows s n p via of_def < "$rd/callers.xml" > "$rd/callers.txt"
-    while IFS="$tab" read -r c_n c_p c_via c_od; do
+    rows s n p via prov of_def < "$rd/callers.xml" | while IFS="$tab" read -r c_n c_p c_via c_prov c_od; do
       [ "$c_via" = name ] && continue
-      if [ -n "$c_od" ] && ! printf '%s\n' "$c_od" | tr ' ' '\n' | grep -qv '~n'; then continue; fi
-      c_f="$2${c_p%:*}"; c_l=${c_p##*:}
+      [ "$c_prov" = split ] && continue
+      if [ "$c_od" != - ] && ! printf '%s\n' "$c_od" | tr ' ' '\n' | grep -qv '~[ns]'; then continue; fi
+      printf '%s%s\t%s\t%s\n' "$2" "${c_p%:*}" "${c_p##*:}" "$c_n"
+    done > "$rd/callers.txt"
+    scope_callers "$1" "$2" "$q_f" "$q_l" "$q_name" "$q_free" "$q_mc" >> "$rd/callers.txt"
+    while IFS="$tab" read -r c_f c_l c_n; do
       grep -qxF "$c_f:$c_l" "$rc_v" && continue
       echo "$c_f:$c_l" >> "$rc_v"
+      case $(compiled "$1" "$2" "$c_f" "$c_l") in 0*) continue ;; esac
       printf '%s\t%s\t%s\t%s\t%s\n' "$c_f" "$c_l" "${c_n##*::}" "$c_n" "$c_n -> $q_chain" >> "$rc_q"
     done < "$rd/callers.txt"
   done
-  echo "no passed test reaches it ($rc_n definitions searched up its resolved callers)"
+  echo "no passed test reaches it ($rc_n definitions searched up its callers)"
   return 1
 }
 
@@ -373,9 +579,11 @@ untested_step() {
           if [ "$a_t" = other ] && [ "$a_n" = tests ]; then in_tests=1; tests_el=$a_el; fi
           case $a_t in fn|method) d_n=$a_n; d_t=$a_t; d_l=$a_l; d_el=$a_el ;; esac
         done < "$rd/at.txt"
-        if [ "$in_tests" = 1 ]; then skip_to=$tests_el; echo "test	$us_f	$d_l	${d_n:-tests}	$d_t" >> "$rd/defs-$us_label.txt"; continue; fi
+        if [ "$in_tests" = 1 ]; then skip_to=$tests_el; echo "test	$us_f	${d_l:--}	${d_n:-tests}	${d_t:--}" >> "$rd/defs-$us_label.txt"; continue; fi
         if [ -z "$d_n" ]; then
-          echo "$us_f:$h_l (in $(tail -1 "$rd/at.txt" | cut -f1,2 | tr '\t' ' '), not a function)" >> "$rd/outside-$us_label.txt"; continue
+          if [ "$(tail -1 "$rd/at.txt" | cut -f2)" = other ]; then echo "$us_f:$h_l" >> "$rd/outside-$us_label.txt"
+          else echo "$us_f:$h_l (in $(tail -1 "$rd/at.txt" | cut -f1,2 | tr '\t' ' '), not a function)" >> "$rd/outside-$us_label.txt"; fi
+          continue
         fi
         skip_to=$d_el
         if is_test_def "$us_f" "$d_l"; then kind="test"; else kind="code"; fi
@@ -384,15 +592,27 @@ untested_step() {
     done
   done
   sort -u "$rd/defs-$us_label.txt" -o "$rd/defs-$us_label.txt"
-  us_fail=0; us_code=0; us_tests=0
+  us_fail=0; us_code=0; us_tests=0; us_other=0
   {
     echo "untested-$us_label: functions and methods this change adds or edits, and the evidence that a passed test reaches each"
     while IFS="$tab" read -r d_kind d_f d_l d_n d_t; do
       if [ "$d_kind" = test ]; then us_tests=$((us_tests + 1)); continue; fi
       us_code=$((us_code + 1))
       if git cat-file -e "$merge_base:$d_f" 2>/dev/null && git show "$merge_base:$d_f" | grep -Eq "fn[[:space:]]+${d_n}[[:space:]]*[<(]"; then age=edited; else age=new; fi
+      d_info=$(def_info "$us_root" "$us_pre" "$d_f" "$d_l" "$d_n")
+      [ "${d_info%%"$tab"*}" = 1 ] && d_t=fn
       ack=$(awk -F'\t' -v k="$d_f:$d_n" '$1 == k { print $2; exit }' .ripwire_untested_acks 2>/dev/null)
+      d_cfg=$(compiled "$us_root" "$us_pre" "$d_f" "$d_l")
+      case $d_cfg in
+        0*)
+          # Compiled out here: no local test run can reach it, so it is neither ok nor a failure.
+          ev="not compiled on $host_os, ${d_cfg#*"$tab"}; no test run on this host can reach it: run the gate where that cfg holds"
+          if [ -n "$ack" ]; then echo "  ACKED $d_f:$d_l $d_n ($age $d_t): $ev; acked in .ripwire_untested_acks: $ack"
+          else echo "  OTHER-OS $d_f:$d_l $d_n ($age $d_t): $ev"; us_other=$((us_other + 1)); fi
+          continue ;;
+      esac
       ev=$(reach "$us_root" "$us_pre" "$d_f" "$d_l" "$d_n"); r=$?
+      [ "$d_cfg" = u ] && ev="$ev (a cfg here could not be evaluated; treated as compiled)"
       if [ "$r" = 0 ]; then
         echo "  ok    $d_f:$d_l $d_n ($age $d_t): $ev"
       elif [ -n "$ack" ]; then
@@ -416,9 +636,11 @@ untested_step() {
         { other = other " " $0 }
         END { flush(); if (f != "") out = out " " f ":" r; print substr(out other, 2) }' "$rd/outside-$us_label.txt")"
     fi
-    echo "  result: $us_code changed functions, $us_fail without a reaching test"
+    echo "  result: $us_code changed functions, $us_fail without a reaching test, $us_other compiled only for another OS (OTHER-OS)"
   } > "$us_rep"
-  grep -q '^  result: .*, 0 without' "$us_rep"
+  [ "$us_fail" = 0 ] || return 1
+  [ "$us_other" = 0 ] || return 3
+  return 0
 }
 
 # run_cargo PKGDIR LOG ARGS...: run cargo test, parse its log; exit = cargo's.
@@ -480,7 +702,7 @@ tests_step() {
           if bun test "./$r_f" < /dev/null > "$rd/bun.txt" 2>&1; then echo "  ran   $r_f: bun test passed"
           else echo "  FAIL  $r_f: bun test failed or bun is missing: $(tail -3 "$rd/bun.txt" | tr '\n' ' ')"; echo x >> "$rd/rowfail-$ts_label"; fi ;;
         *)
-          if [ -n "$r_run" ]; then
+          if [ "${r_run:--}" != - ]; then
             if ( cd "$ts_root" && sh -c "$r_run" ) < /dev/null > "$rd/run.txt" 2>&1; then echo "  ran   $r_f: run=\"$r_run\" passed"
             else echo "  FAIL  $r_f: run=\"$r_run\" failed: $(tail -3 "$rd/run.txt" | tr '\n' ' ')"; echo x >> "$rd/rowfail-$ts_label"; fi
           else
@@ -500,13 +722,15 @@ tests_step() {
 if [ -n "$app_files" ]; then
   if tests_step app . "" "$app_files"; then v=pass; else v=FAIL; fi
   verdict tests-app "$v" "see below"
-  if untested_step app . "" "$app_files"; then v=pass; else v=FAIL; fi
+  untested_step app . "" "$app_files"
+  case $? in 0) v=pass ;; 3) v=INCOMPLETE ;; *) v=FAIL ;; esac
   verdict untested-app "$v" "see below"
 fi
 if [ -n "$kit_files" ]; then
   if tests_step kit vendor/gpui-kit vendor/gpui-kit/ "$kit_files"; then v=pass; else v=FAIL; fi
   verdict tests-kit "$v" "see below"
-  if untested_step kit vendor/gpui-kit vendor/gpui-kit/ "$kit_files"; then v=pass; else v=FAIL; fi
+  untested_step kit vendor/gpui-kit vendor/gpui-kit/ "$kit_files"
+  case $? in 0) v=pass ;; 3) v=INCOMPLETE ;; *) v=FAIL ;; esac
   verdict untested-kit "$v" "see below"
 fi
 
@@ -535,4 +759,8 @@ grep -o '<clones [^>]*>' "$out/clones.xml" | sed 's#^#  #' | cut -c1-200
 grep -o '<doc-drift [^>]*>' "$out/doc-drift.xml" | sed 's#^#  #'
 echo "gate: full output in $out/"
 if [ "$failed" = 1 ]; then echo "gate: FAIL"; exit 1; fi
+if [ "$incomplete" = 1 ]; then
+  echo "gate: INCOMPLETE: every check that can run on $host_os passed, but changed code compiled only for another OS (OTHER-OS rows) was not tested; run the gate there, or ack it"
+  exit 3
+fi
 echo "gate: PASS"

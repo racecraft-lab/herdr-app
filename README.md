@@ -72,12 +72,32 @@ keeps both obligations and turns each into a check that needs evidence:
   `ripwire --regex` finds the call sites of the name, and a site counts when
   its enclosing definition is a passed cargo test, in the same file or through
   `module::name`. Failing and ignored tests do not count. The gate then walks
-  up `ripwire --callers` through resolved edges only, so a test that calls a
-  caller also counts. Name-only edges are skipped, because they credit
-  `tests/shot_pixels.rs` with code in `src/terminal.rs` it cannot call.
+  up the callers, so a test that calls a caller also counts. A caller counts
+  in two cases:
+  - Ripwire resolved the edge. Rows marked `via="name"` (name only) or
+    `prov="split"` (one arm of a call split between same-named definitions)
+    are skipped. Both credit tests that cannot call the code: the split arm
+    from `sprites::paint` once credited `tests/shot_pixels.rs` with the
+    non-macOS `drops::start` stub.
+  - Rust's path rules bind the call site to the function. Ripwire reads a fn
+    inside an inline `mod` as a method and leaves its calls unbound (for
+    example `prune(dir)?` in `drops::mac::copy_into`). So the gate reads the
+    call sites itself. A call counts when it is bare in the same module (and
+    the caller binds no local of that name), `self::` or `super::` from the
+    right module, `mod::name` from the same file, or `file_module::name` with
+    the function at the file's top level or re-exported there by `pub use`.
+
   `src/main.rs::main` counts as reached when a passed test spawns the binary
   (`CARGO_BIN_EXE_herdr-app`), which ripwire does not model; that credit stops
   at `main` and does not pass to its callees.
+- **code for another OS**. A definition whose `cfg(...)` (on itself, an
+  enclosing `mod`, the file's `#![cfg]` or its `mod name;` line) is false on
+  this host is not compiled here, so no local test run can reach it. It gets
+  an `OTHER-OS` row, neither ok nor FAIL, and the gate ends `INCOMPLETE`
+  (exit 3) when nothing else failed. Run the gate on an OS where that cfg
+  holds, or ack it. A caller that is compiled out here never passes credit
+  on. A cfg the gate cannot evaluate (a `feature`, say) counts as compiled,
+  and the row says so.
 - The `<u>` rows are callers outside the change. Their gaps predate the
   change, so they are listed in full in `.ripwire/out/untested-radius-app.txt`
   and do not block.
@@ -86,7 +106,9 @@ Every row the gate prints says how it was discharged: the test target that
 ran, or the passed test and call path that reaches each changed function.
 `.ripwire_untested_acks` accepts a named function without a test. Like
 `--quality-ack`, an entry is the maintainer's call, in its own reviewed commit
-here, and the gate prints its reason. The file does not exist yet.
+here, and the gate prints its reason. An entry covers every definition of
+that name in that file, so it also covers a cfg twin (the macOS `start` and
+its non-macOS stub). The file does not exist yet.
 
 Limits:
 
@@ -108,6 +130,10 @@ Limits:
   that touches the kit therefore fails `tests-kit` until that changes.
 - A caller that lost its only tested path, because a changed function stopped
   calling it, is not detected.
+- The path rules read one line per call site. A call split across lines, a
+  `use` alias (`use x::prune as p`), or a function passed by value
+  (`.map(is_sandboxed)`) is not seen, so its target can read as unreached.
+  Methods (impl members) rely on ripwire's resolved edges alone.
 
 ## Regenerating after a ripwire upgrade or a rules change
 

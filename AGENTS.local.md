@@ -70,6 +70,12 @@ It fails (exit 1) when any of these fails:
 - The same two for `vendor/gpui-kit` when touched. Its crates cannot be
   tested from this checkout yet, so that step fails closed.
 
+A changed definition whose `cfg(...)` is false on this machine (a
+`cfg(not(target_os = "macos"))` stub on a Mac) is not compiled here, so it
+gets an `OTHER-OS` row. If nothing failed, the gate then ends `INCOMPLETE`
+with exit 3, not `PASS`. Say in the PR which definitions still need a run on
+another OS.
+
 Ripwire does not model in-file `#[cfg(test)]` unit tests as tests here. It
 names only `tests/*.rs` targets, and it reports new `#[test]` functions as
 new-symbol `dead-code`, which never gates. The gate makes up for this: a
