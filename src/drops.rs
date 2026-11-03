@@ -17,6 +17,14 @@ pub fn start() {}
 #[cfg(target_os = "macos")]
 pub use mac::{stage, start};
 
+#[cfg(all(test, not(target_os = "macos")))]
+#[test]
+fn elsewhere_drops_are_left_alone() {
+    start();
+    let path = std::path::PathBuf::from("/tmp/TemporaryItems/NSIRD_x/a.png");
+    assert_eq!(stage(vec![path.clone()]), [path]);
+}
+
 #[cfg(target_os = "macos")]
 mod mac {
     use std::io::{Error, ErrorKind, Read};
